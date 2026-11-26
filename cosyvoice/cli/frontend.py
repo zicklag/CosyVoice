@@ -43,9 +43,11 @@ class CosyVoiceFrontEnd:
         option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         option.intra_op_num_threads = 1
         self.campplus_session = onnxruntime.InferenceSession(campplus_model, sess_options=option, providers=["CPUExecutionProvider"])
+        # On small-VRAM GPUs (<6GB) run the speech tokenizer on CPU to leave room for the models
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 2**30 if torch.cuda.is_available() else 0
+        st_providers = ["CUDAExecutionProvider"] if (torch.cuda.is_available() and vram_gb >= 6) else ["CPUExecutionProvider"]
         self.speech_tokenizer_session = onnxruntime.InferenceSession(speech_tokenizer_model, sess_options=option,
-                                                                     providers=["CUDAExecutionProvider" if torch.cuda.is_available() else
-                                                                                "CPUExecutionProvider"])
+                                                                     providers=st_providers)
         if os.path.exists(spk2info):
             self.spk2info = torch.load(spk2info, map_location=self.device, weights_only=True)
         else:
@@ -66,10 +68,25 @@ class CosyVoiceFrontEnd:
             try:
                 from wetext import Normalizer as ZhNormalizer
                 from wetext import Normalizer as EnNormalizer
-                self.zh_tn_model = ZhNormalizer(remove_erhua=False)
-                self.en_tn_model = EnNormalizer()
+
+                # use FSTs bundled in pretrained_models/wetext to avoid modelscope SDK rate limits
+                fst_root = os.environ.get('WETEXT_FST_ROOT') or os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                    'pretrained_models', 'wetext')
+                zh_tagger = '{}/zh/tn/tagger.fst'.format(fst_root)
+                zh_verbalizer = '{}/zh/tn/verbalizer.fst'.format(fst_root)
+                en_tagger = '{}/en/tn/tagger.fst'.format(fst_root)
+                en_verbalizer = '{}/en/tn/verbalizer.fst'.format(fst_root)
+                if all(os.path.exists(p) for p in [zh_tagger, zh_verbalizer, en_tagger, en_verbalizer]):
+                    self.zh_tn_model = ZhNormalizer(tagger_path=zh_tagger, verbalizer_path=zh_verbalizer,
+                                                    lang='zh', remove_erhua=False)
+                    self.en_tn_model = EnNormalizer(tagger_path=en_tagger, verbalizer_path=en_verbalizer, lang='en')
+                    logging.info('use wetext frontend (local FSTs at {})'.format(fst_root))
+                else:
+                    self.zh_tn_model = ZhNormalizer(remove_erhua=False)
+                    self.en_tn_model = EnNormalizer()
+                    logging.info('use wetext frontend (modelscope)')
                 self.text_frontend = 'wetext'
-                logging.info('use wetext frontend')
             except:
                 self.text_frontend = ''
                 logging.info('no frontend is avaliable')
